@@ -29,13 +29,59 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
+    try:
+        r = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+    except Exception as e:  # ConnectError (stop) hoặc ReadTimeout (netblock)
+        return False, type(e).__name__
+    if r.status_code == 200:
+        return True, "ready"
+    try:
+        reasons = r.json().get("reasons") or []
+    except ValueError:
+        reasons = []
+    return False, f"http_{r.status_code}:" + ",".join(reasons)
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Vòng lặp poll + phát hiện transition + ghi JSONL.
+
+    Mỗi region bắt đầu ở HEALTHY (giả định) và chỉ đổi trạng thái sau `threshold` lần
+    probe LIÊN TIẾP cùng chiều — cả khi xuống (UNHEALTHY) lẫn khi lên lại (HEALTHY),
+    để 1 probe lẻ không làm trạng thái lật qua lật lại.
+    Ngủ đủ `interval` SAU mỗi vòng probe: chu kỳ thật = interval + thời gian probe,
+    nên detect không bao giờ nhanh hơn interval × threshold.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    st = {r: {"state": "HEALTHY", "fails": 0, "oks": 0} for r in URL}
+    end = time.time() + duration
+    with out.open("a", encoding="utf-8") as f:
+        while time.time() < end:
+            for region, s in st.items():
+                ok, reason = probe(region, timeout)
+                if ok:
+                    s["fails"], s["oks"] = 0, s["oks"] + 1
+                else:
+                    s["fails"], s["oks"] = s["fails"] + 1, 0
+                new = s["state"]
+                if s["state"] == "HEALTHY" and s["fails"] >= threshold:
+                    new = "UNHEALTHY"
+                elif s["state"] == "UNHEALTHY" and s["oks"] >= threshold:
+                    new = "HEALTHY"
+                if new == s["state"]:
+                    continue
+                rec = {"ts": time.time(),
+                       "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                       "event": "state_change", "region": region,
+                       "from": s["state"], "to": new, "reason": reason,
+                       "consecutive_fails": s["fails"], "consecutive_oks": s["oks"],
+                       "interval_s": interval, "threshold": threshold,
+                       "timeout_s": timeout}
+                s["state"] = new
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
+                print("HEALTH", json.dumps(rec), flush=True)
+            time.sleep(interval)
 
 
 if __name__ == "__main__":
